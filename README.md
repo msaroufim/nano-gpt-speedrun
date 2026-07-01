@@ -95,6 +95,13 @@ python optimizer_family_lab.py --optimizers all --steps 100 --device cuda
 ```
 
 Metrics are written to `optimizer_family_runs/<timestamp>/metrics.csv`, with a ranked `summary.md` and machine-readable `summary.json` in the same directory.
+The runner also writes `loss_curves.svg` and, when Matplotlib is available, `loss_curves.png`.
+
+Use PyTorch-native constructor defaults where `torch.optim` has the optimizer:
+
+```bash
+python optimizer_family_lab.py --optimizers all --optimizer-preset pytorch-defaults --grad-clip 0 --device cuda
+```
 
 Optimizer names map to the family-tree categories as follows:
 
@@ -109,6 +116,12 @@ Optimizer names map to the family-tree categories as follows:
 | Secant / quasi-Newton | `bfgs`, `lbfgs` |
 
 The `kfac` and `psgd` implementations are generic parameter-local proxies because real K-FAC and production PSGD need module-level curvature or preconditioner plumbing. `bfgs` stores a dense inverse Hessian and is guarded by `--bfgs-max-params`, so shrink `--n-embd`, `--n-layer`, or use `lbfgs` when trying larger toy models.
+
+For a one-GPU C2 run through CoreAuto's artifact-backed launcher:
+
+```bash
+CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch optimizer_family_c2_launch:OptimizerFamilyLabC2 --job-name optimizer-family-lab --cluster c2 --yes --no-watch
+```
 
 ## Alternative: Running with Docker (recommended for precise timing)
 

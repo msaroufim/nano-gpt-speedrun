@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import math
 import time
@@ -16,6 +17,7 @@ from torch import Tensor, nn
 from optimizer_families import (
     OPTIMIZER_FAMILIES,
     build_optimizer,
+    build_pytorch_default_optimizer,
     optimizer_metadata,
     resolve_optimizer_names,
 )
@@ -53,6 +55,7 @@ class ExperimentResult:
 
     optimizer: str
     family: str
+    implementation: str
     status: str
     lr: float
     steps_completed: int
@@ -167,6 +170,12 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Compare optimizer families on a tiny GPT task.")
     parser.add_argument("--optimizers", default="core", help="'core', 'all', or comma-separated names")
+    parser.add_argument(
+        "--optimizer-preset",
+        choices=("registry", "pytorch-defaults"),
+        default="registry",
+        help="registry uses the lab learning-rate registry; pytorch-defaults uses torch.optim defaults where available",
+    )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--eval-interval", type=int, default=10)
     parser.add_argument("--eval-batches", type=int, default=8)
@@ -177,13 +186,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-embd", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=None, help="override the registry learning rate for every optimizer")
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, etc.")
     parser.add_argument("--corpus-repeats", type=int, default=128)
     parser.add_argument("--bfgs-max-params", type=int, default=12000)
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--no-weight-tie", action="store_true")
     return parser.parse_args()
 
@@ -275,20 +285,17 @@ def run_one_optimizer(
     model = TinyGPT(config).to(device)
     model.load_state_dict(base_state)
     model.train()
-    lr = metadata.suggested_lr if args.lr is None else args.lr
     metrics = []
     final_train_loss = None
     final_val_loss = None
     steps_completed = 0
     start_time = time.perf_counter()
+    lr = float("nan")
+    implementation = ""
     try:
-        optimizer = build_optimizer(
-            name,
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            bfgs_max_params=args.bfgs_max_params,
-        )
+        optimizer = build_experiment_optimizer(name, model.parameters(), args)
+        lr = float(optimizer.param_groups[0].get("lr", float("nan")))
+        implementation = f"{optimizer.__class__.__module__}.{optimizer.__class__.__name__}"
         for step in range(args.steps):
             x, y = get_batch(train_tokens, train_starts, step, args.seq_len, device)
             if metadata.closure_required:
@@ -299,6 +306,8 @@ def run_one_optimizer(
                     if loss is None:
                         raise RuntimeError("expected a training loss")
                     loss.backward()
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     return loss
 
                 loss = optimizer.step(closure)
@@ -325,6 +334,8 @@ def run_one_optimizer(
                 {
                     "optimizer": name,
                     "family": metadata.family,
+                    "implementation": implementation,
+                    "preset": args.optimizer_preset,
                     "status": "ok",
                     "step": steps_completed,
                     "tokens": steps_completed * args.batch_size * args.seq_len,
@@ -344,6 +355,8 @@ def run_one_optimizer(
             {
                 "optimizer": name,
                 "family": metadata.family,
+                "implementation": implementation,
+                "preset": args.optimizer_preset,
                 "status": status,
                 "step": steps_completed,
                 "tokens": steps_completed * args.batch_size * args.seq_len,
@@ -361,6 +374,7 @@ def run_one_optimizer(
         ExperimentResult(
             optimizer=name,
             family=metadata.family,
+            implementation=implementation,
             status=status,
             lr=lr,
             steps_completed=steps_completed,
@@ -370,6 +384,25 @@ def run_one_optimizer(
             error=error,
         ),
         metrics,
+    )
+
+
+def build_experiment_optimizer(name: str, params: Iterable[Tensor], args: argparse.Namespace) -> torch.optim.Optimizer:
+    """Build the requested optimizer preset."""
+    if args.optimizer_preset == "pytorch-defaults":
+        return build_pytorch_default_optimizer(
+            name,
+            params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            bfgs_max_params=args.bfgs_max_params,
+        )
+    return build_optimizer(
+        name,
+        params,
+        lr=args.lr,
+        weight_decay=0.0 if args.weight_decay is None else args.weight_decay,
+        bfgs_max_params=args.bfgs_max_params,
     )
 
 
@@ -386,6 +419,8 @@ def write_metrics(output_dir: Path, rows: Iterable[dict[str, str | int | float |
     fieldnames = [
         "optimizer",
         "family",
+        "implementation",
+        "preset",
         "status",
         "step",
         "tokens",
@@ -418,14 +453,15 @@ def write_summary(output_dir: Path, results: list[ExperimentResult], config: dic
     lines = [
         "# Optimizer Family Lab",
         "",
-        "| Optimizer | Family | Status | LR | Steps | Final train loss | Final val loss | Seconds |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Optimizer | Family | Implementation | Status | LR | Steps | Final train loss | Final val loss | Seconds |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in sorted(results, key=summary_sort_key):
         train = "-" if result.final_train_loss is None else f"{result.final_train_loss:.4f}"
         val = "-" if result.final_val_loss is None else f"{result.final_val_loss:.4f}"
+        implementation = result.implementation.rsplit(".", 1)[-1] if result.implementation else "-"
         lines.append(
-            f"| {result.optimizer} | {result.family} | {result.status} | {result.lr:.5g} | "
+            f"| {result.optimizer} | {result.family} | {implementation} | {result.status} | {result.lr:.5g} | "
             f"{result.steps_completed} | {train} | {val} | {result.elapsed_seconds:.2f} |"
         )
     failed = [result for result in results if result.status != "ok"]
@@ -446,14 +482,157 @@ def summary_sort_key(result: ExperimentResult) -> tuple[int, float, str]:
 def print_summary(results: list[ExperimentResult], output_dir: Path) -> None:
     """Print a compact console summary."""
     print(f"\nWrote optimizer-family metrics to {output_dir}")
-    print("optimizer        family                          status   val_loss   seconds")
-    print("---------------  ------------------------------  -------  ---------  -------")
+    print("optimizer        family                          implementation  status   val_loss   seconds")
+    print("---------------  ------------------------------  --------------  -------  ---------  -------")
     for result in sorted(results, key=summary_sort_key):
         val = "-" if result.final_val_loss is None else f"{result.final_val_loss:.4f}"
+        implementation = result.implementation.rsplit(".", 1)[-1] if result.implementation else "-"
         print(
-            f"{result.optimizer:<15}  {result.family:<30}  {result.status:<7}  "
+            f"{result.optimizer:<15}  {result.family:<30}  {implementation:<14}  {result.status:<7}  "
             f"{val:>9}  {result.elapsed_seconds:>7.2f}"
         )
+
+
+def write_loss_curve_plots(output_dir: Path, rows: list[dict[str, str | int | float | None]]) -> list[Path]:
+    """Write loss-curve plot artifacts."""
+    svg_path = output_dir / "loss_curves.svg"
+    write_loss_curve_svg(svg_path, rows)
+    paths = [svg_path]
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return paths
+    by_optimizer = group_metric_rows(rows)
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for optimizer, optimizer_rows in by_optimizer.items():
+        train_points = [
+            (int(row["step"]), float(row["train_loss"]))
+            for row in optimizer_rows
+            if row.get("train_loss") not in (None, "")
+        ]
+        val_points = [
+            (int(row["step"]), float(row["val_loss"]))
+            for row in optimizer_rows
+            if row.get("val_loss") not in (None, "")
+        ]
+        if train_points:
+            x, y = zip(*train_points)
+            (line,) = ax.plot(x, y, linewidth=1.8, label=f"{optimizer} train")
+            if val_points:
+                vx, vy = zip(*val_points)
+                ax.plot(vx, vy, linestyle="--", marker="o", markersize=3, linewidth=1.0, color=line.get_color())
+    ax.set_title("Optimizer family toy NanoGPT loss curves")
+    ax.set_xlabel("step")
+    ax.set_ylabel("cross-entropy loss")
+    ax.grid(True, alpha=0.25)
+    ax.legend(ncols=2, fontsize=8)
+    fig.tight_layout()
+    png_path = output_dir / "loss_curves.png"
+    fig.savefig(png_path, dpi=180)
+    fig.savefig(svg_path)
+    plt.close(fig)
+    paths.append(png_path)
+    return paths
+
+
+def group_metric_rows(rows: list[dict[str, str | int | float | None]]) -> dict[str, list[dict[str, str | int | float | None]]]:
+    """Group metric rows by optimizer name."""
+    grouped: dict[str, list[dict[str, str | int | float | None]]] = {}
+    for row in rows:
+        optimizer = str(row.get("optimizer") or "")
+        if not optimizer:
+            continue
+        grouped.setdefault(optimizer, []).append(row)
+    return grouped
+
+
+def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | None]]) -> None:
+    """Write a dependency-free SVG loss curve fallback."""
+    width = 1200
+    height = 720
+    pad_left = 76
+    pad_right = 220
+    pad_top = 42
+    pad_bottom = 70
+    plot_width = width - pad_left - pad_right
+    plot_height = height - pad_top - pad_bottom
+    grouped = group_metric_rows(rows)
+    points_by_optimizer = {}
+    all_steps = []
+    all_losses = []
+    for optimizer, optimizer_rows in grouped.items():
+        points = [
+            (int(row["step"]), float(row["train_loss"]))
+            for row in optimizer_rows
+            if row.get("train_loss") not in (None, "")
+        ]
+        if not points:
+            continue
+        points_by_optimizer[optimizer] = points
+        all_steps.extend(step for step, _ in points)
+        all_losses.extend(loss for _, loss in points)
+    if not all_steps or not all_losses:
+        path.write_text("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>\n")
+        return
+    min_step = min(all_steps)
+    max_step = max(all_steps)
+    min_loss = min(all_losses)
+    max_loss = max(all_losses)
+    if math.isclose(min_loss, max_loss):
+        min_loss -= 0.5
+        max_loss += 0.5
+    colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+        "#4c78a8",
+        "#f58518",
+        "#54a24b",
+        "#b279a2",
+    ]
+
+    def x_scale(step: int) -> float:
+        if max_step == min_step:
+            return pad_left + plot_width / 2
+        return pad_left + (step - min_step) * plot_width / (max_step - min_step)
+
+    def y_scale(loss: float) -> float:
+        return pad_top + (max_loss - loss) * plot_height / (max_loss - min_loss)
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="{pad_left}" y="26" font-family="Arial" font-size="20" font-weight="700">Optimizer family toy NanoGPT loss curves</text>',
+        f'<line x1="{pad_left}" y1="{pad_top + plot_height}" x2="{pad_left + plot_width}" y2="{pad_top + plot_height}" stroke="#333"/>',
+        f'<line x1="{pad_left}" y1="{pad_top}" x2="{pad_left}" y2="{pad_top + plot_height}" stroke="#333"/>',
+        f'<text x="{pad_left + plot_width / 2}" y="{height - 18}" font-family="Arial" font-size="14" text-anchor="middle">step</text>',
+        f'<text x="18" y="{pad_top + plot_height / 2}" font-family="Arial" font-size="14" transform="rotate(-90 18 {pad_top + plot_height / 2})" text-anchor="middle">cross-entropy loss</text>',
+    ]
+    for tick_index in range(6):
+        loss = min_loss + (max_loss - min_loss) * tick_index / 5
+        y = y_scale(loss)
+        parts.append(f'<line x1="{pad_left}" y1="{y:.2f}" x2="{pad_left + plot_width}" y2="{y:.2f}" stroke="#ddd"/>')
+        parts.append(
+            f'<text x="{pad_left - 10}" y="{y + 4:.2f}" font-family="Arial" font-size="12" text-anchor="end">{loss:.2f}</text>'
+        )
+    for index, (optimizer, points) in enumerate(points_by_optimizer.items()):
+        color = colors[index % len(colors)]
+        polyline = " ".join(f"{x_scale(step):.2f},{y_scale(loss):.2f}" for step, loss in points)
+        parts.append(f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2"/>')
+        legend_y = pad_top + 24 + index * 22
+        parts.append(f'<line x1="{pad_left + plot_width + 28}" y1="{legend_y}" x2="{pad_left + plot_width + 56}" y2="{legend_y}" stroke="{color}" stroke-width="3"/>')
+        parts.append(
+            f'<text x="{pad_left + plot_width + 64}" y="{legend_y + 4}" font-family="Arial" font-size="13">{html.escape(optimizer)}</text>'
+        )
+    parts.append("</svg>")
+    path.write_text("\n".join(parts) + "\n")
 
 
 def main() -> None:
@@ -490,6 +669,9 @@ def main() -> None:
         "seq_len": args.seq_len,
         "eval_interval": args.eval_interval,
         "eval_batches": args.eval_batches,
+        "optimizer_preset": args.optimizer_preset,
+        "weight_decay": args.weight_decay,
+        "grad_clip": args.grad_clip,
         "model": asdict(config),
         "parameter_count": param_count,
         "optimizer_names": optimizer_names,
@@ -514,6 +696,10 @@ def main() -> None:
         all_metrics.extend(metrics)
     write_metrics(output_dir, all_metrics)
     write_summary(output_dir, results, run_config)
+    if not args.no_plot:
+        plot_paths = write_loss_curve_plots(output_dir, all_metrics)
+        for plot_path in plot_paths:
+            print(f"Wrote {plot_path}")
     print_summary(results, output_dir)
 
 

@@ -630,6 +630,16 @@ OPTIMIZER_FAMILIES: dict[str, OptimizerFamily] = {
     ),
 }
 
+PYTORCH_DEFAULT_NATIVE_OPTIMIZERS: tuple[str, ...] = (
+    "sgd",
+    "momentum",
+    "nesterov",
+    "adagrad",
+    "rmsprop",
+    "adamw",
+    "lbfgs",
+)
+
 CORE_OPTIMIZERS: tuple[str, ...] = (
     "sgd",
     "momentum",
@@ -690,6 +700,65 @@ def build_optimizer(
     if name == "bfgs":
         return BFGSFamily(params, lr=selected_lr, max_params=bfgs_max_params)
     raise AssertionError(f"unhandled optimizer {name}")
+
+
+def build_pytorch_default_optimizer(
+    name: str,
+    params: Iterable[Tensor],
+    lr: float | None = None,
+    weight_decay: float | None = None,
+    bfgs_max_params: int = 12000,
+) -> Optimizer:
+    """Build a native PyTorch optimizer with constructor defaults when available.
+
+    Some family-tree entries do not exist in ``torch.optim``. Those names fall
+    back to the lab implementation and keep the registry defaults.
+    """
+    name = name.lower()
+    params = list(params)
+    if name == "sgd":
+        return torch.optim.SGD(params, **pytorch_common_kwargs(lr, weight_decay))
+    if name == "momentum":
+        kwargs = pytorch_common_kwargs(lr, weight_decay)
+        kwargs["momentum"] = 0.9
+        return torch.optim.SGD(params, **kwargs)
+    if name == "nesterov":
+        kwargs = pytorch_common_kwargs(lr, weight_decay)
+        kwargs["momentum"] = 0.9
+        kwargs["nesterov"] = True
+        return torch.optim.SGD(params, **kwargs)
+    if name == "adagrad":
+        return torch.optim.Adagrad(params, **pytorch_common_kwargs(lr, weight_decay))
+    if name == "rmsprop":
+        return torch.optim.RMSprop(params, **pytorch_common_kwargs(lr, weight_decay))
+    if name == "adamw":
+        return torch.optim.AdamW(params, **pytorch_common_kwargs(lr, weight_decay))
+    if name == "adafactor" and hasattr(torch.optim, "Adafactor"):
+        return torch.optim.Adafactor(params, **pytorch_common_kwargs(lr, weight_decay))
+    if name == "lbfgs":
+        if weight_decay not in (None, 0.0):
+            raise ValueError("torch.optim.LBFGS does not accept weight_decay")
+        kwargs = {}
+        if lr is not None:
+            kwargs["lr"] = lr
+        return torch.optim.LBFGS(params, **kwargs)
+    return build_optimizer(
+        name,
+        params,
+        lr=lr,
+        weight_decay=0.0 if weight_decay is None else weight_decay,
+        bfgs_max_params=bfgs_max_params,
+    )
+
+
+def pytorch_common_kwargs(lr: float | None, weight_decay: float | None) -> dict[str, float]:
+    """Return optional kwargs while preserving PyTorch constructor defaults."""
+    kwargs = {}
+    if lr is not None:
+        kwargs["lr"] = lr
+    if weight_decay is not None:
+        kwargs["weight_decay"] = weight_decay
+    return kwargs
 
 
 def call_closure(closure: Callable[[], Tensor] | None) -> Tensor | None:
