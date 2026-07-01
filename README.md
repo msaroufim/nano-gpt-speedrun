@@ -140,6 +140,13 @@ CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch real_keller_speed
 ```
 
 This sweep keeps the Keller model, FineWeb data, validation loop, and batch-size schedule. For non-Keller optimizers it uses replicated dense gradient all-reduce instead of the record trainer's sharded optimizer path, so the sweep is for optimizer-family comparison rather than speedrun-record timing. Dense BFGS and closure-based L-BFGS are included in the default list so their unsupported status is captured in the sweep summary instead of being silently omitted.
+If an already-finished sweep needs artifacts regenerated, run the postprocess-only launcher against the same output directory:
+
+```bash
+CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch real_keller_speedrun_c2_launch:RealKellerOptimizerSweepPostprocessC2 --job-name real-keller-optimizer-sweep-postprocess --cluster c2 --set output_dir=/mnt/c2-datadisk/joblogs/training/mark/real-keller-optimizer-sweep/<job-name> --yes --no-watch
+```
+
+The sweep summary treats non-finite validation losses such as `nan` or `inf` as diverged runs rather than silently falling back to an earlier finite validation point.
 
 ## Alternative: Running with Docker (recommended for precise timing)
 

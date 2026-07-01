@@ -271,6 +271,63 @@ class RealKellerOptimizerSweepC2:
 
 
 @dataclass
+class RealKellerOptimizerSweepPostprocessC2:
+    """Core Launch builder for repairing or republishing optimizer sweep artifacts."""
+
+    launch_job_name: str = "real-keller-optimizer-sweep-postprocess"
+    output_dir: str = ""
+    image: str = DEFAULT_IMAGE
+
+    def build(self) -> JobBundle:
+        """Build the C2 launch bundle."""
+        resolved_output_dir = self.output_dir or f"{DEFAULT_SWEEP_OUTPUT_ROOT}/{self.launch_job_name}"
+        if not resolved_output_dir.startswith("/mnt/c2-datadisk/"):
+            raise ValueError("output_dir must be under /mnt/c2-datadisk")
+        runtime = RuntimeConfig(
+            image=self.image,
+            command=["bash", "-lc", self.build_command(resolved_output_dir)],
+            workdir=DEFAULT_POSTPROCESS_CHECKOUT,
+            env={"PYTHONUNBUFFERED": "1"},
+            resources=ResourceConfig(cpu="4", memory="16Gi", ephemeral_storage="20Gi"),
+            distributed=DistributedConfig(nodes=1, parallelism=1, gpus_per_node=0, coordination="indexed"),
+            retries=0,
+            ttl_seconds_after_finished=7 * 24 * 60 * 60,
+            volumes=[{"name": "c2-datadisk", "mountPath": "/mnt/c2-datadisk", "clusterVolume": "c2-datadisk"}],
+            labels={"core.experiment": "real-keller-optimizer-sweep-postprocess", "core.owner": "mark"},
+            source_bundle=SourceBundleConfig(
+                repo_root=str(REPO_ROOT),
+                include_paths=["real_keller_speedrun_c2_launch.py"],
+                volume_name="c2-datadisk",
+                checkout_path=DEFAULT_POSTPROCESS_CHECKOUT,
+            ),
+        )
+        return JobBundle(job_name=self.launch_job_name, runtime=runtime, output_dir=resolved_output_dir)
+
+    def build_command(self, output_dir: str) -> str:
+        """Build the shell command run inside the C2 sweep postprocess job."""
+        quoted_output_dir = shlex.quote(output_dir)
+        return "\n".join(
+            [
+                "set -euo pipefail",
+                f"export SWEEP_OUTPUT_DIR={quoted_output_dir}",
+                'mkdir -p "$SWEEP_OUTPUT_DIR" "$SWEEP_OUTPUT_DIR/home" "$SWEEP_OUTPUT_DIR/cache" "$SWEEP_OUTPUT_DIR/matplotlib" "$SWEEP_OUTPUT_DIR/pip"',
+                'export HOME="$SWEEP_OUTPUT_DIR/home"',
+                'export XDG_CACHE_HOME="$SWEEP_OUTPUT_DIR/cache"',
+                'export MPLCONFIGDIR="$SWEEP_OUTPUT_DIR/matplotlib"',
+                'export PIP_CACHE_DIR="$SWEEP_OUTPUT_DIR/pip"',
+                'export PIP_DISABLE_PIP_VERSION_CHECK=1',
+                'test -d "$SWEEP_OUTPUT_DIR/runs"',
+                "python3 - <<'PY' || python3 -m pip install --no-cache-dir --target \"$SWEEP_OUTPUT_DIR/postprocess_pydeps\" matplotlib",
+                "import matplotlib",
+                "print('matplotlib_available', matplotlib.__version__)",
+                "PY",
+                'if [ -d "$SWEEP_OUTPUT_DIR/postprocess_pydeps" ]; then export PYTHONPATH="$SWEEP_OUTPUT_DIR/postprocess_pydeps:${PYTHONPATH:-}"; fi',
+                *build_sweep_postprocess_shell_lines(),
+            ]
+        )
+
+
+@dataclass
 class RealKellerSpeedrunPostprocessC2:
     """Core Launch builder for publishing artifacts from a finished speedrun."""
 
@@ -408,11 +465,24 @@ def build_sweep_postprocess_shell_lines() -> list[str]:
         "from pathlib import Path",
         "import csv",
         "import json",
+        "import math",
         "import os",
         "import re",
         "root = Path(os.environ['SWEEP_OUTPUT_DIR'])",
         "runs_root = root / 'runs'",
-        "pattern = re.compile(r'step:(\\d+)/(\\d+) val_loss:([0-9.]+) train_time:([0-9]+)ms step_avg:([0-9.]+)ms')",
+        "loss_re = r'([+-]?(?:nan|inf|[0-9]+(?:\\.[0-9]+)?))'",
+        "pattern = re.compile(r'step:(\\d+)/(\\d+) val_loss:' + loss_re + r' train_time:([0-9]+)ms step_avg:([0-9.]+)ms', re.IGNORECASE)",
+        "def loss_sort_key(row):",
+        "    loss = row['final_val_loss']",
+        "    if loss is None or not math.isfinite(loss):",
+        "        return (1, float('inf'), row['optimizer'])",
+        "    return (0, loss, row['optimizer'])",
+        "def loss_text(loss):",
+        "    if loss is None:",
+        "        return '-'",
+        "    if not math.isfinite(loss):",
+        "        return str(loss)",
+        "    return f'{loss:.4f}'",
         "schedule_rows = [",
         "    {'stage': 1, 'step_start': 0, 'step_end': 460, 'global_tokens_per_step': 8 * 2048 * 8, 'max_seq_len': 896, 'window_sizes': [1, 3], 'lr_mul': 1.0},",
         "    {'stage': 2, 'step_start': 460, 'step_end': 920, 'global_tokens_per_step': 16 * 2048 * 8, 'max_seq_len': 2048, 'window_sizes': [3, 7], 'lr_mul': 1.52},",
@@ -449,7 +519,9 @@ def build_sweep_postprocess_shell_lines() -> list[str]:
         "        points_by_optimizer[optimizer] = rows",
         "    final = rows[-1] if rows else None",
         "    returncode = status.get('returncode')",
-        "    run_status = 'ok' if returncode == 0 and final is not None else 'failed'",
+        "    run_status = 'ok' if returncode == 0 and final is not None and math.isfinite(final['val_loss']) else 'failed'",
+        "    if returncode == 0 and final is not None and not math.isfinite(final['val_loss']):",
+        "        run_status = 'diverged'",
         "    if returncode == 124:",
         "        run_status = 'timeout'",
         "    error = ''",
@@ -487,11 +559,11 @@ def build_sweep_postprocess_shell_lines() -> list[str]:
         "with (root / 'sweep_summary.csv').open('w', newline='') as f:",
         "    writer = csv.DictWriter(f, fieldnames=fieldnames)",
         "    writer.writeheader()",
-        "    writer.writerows(sorted(summary_rows, key=lambda r: (r['final_val_loss'] is None, float('inf') if r['final_val_loss'] is None else r['final_val_loss'], r['optimizer'])))",
+        "    writer.writerows(sorted(summary_rows, key=loss_sort_key))",
         "(root / 'sweep_summary.json').write_text(json.dumps({'results': summary_rows, 'training_schedule': schedule_rows}, indent=2) + '\\n')",
         "lines = ['# Real Keller Optimizer Sweep', '', '| Optimizer | Status | Final val loss | Step | Train time ms | Step avg ms |', '| --- | --- | ---: | ---: | ---: | ---: |']",
-        "for row in sorted(summary_rows, key=lambda r: (r['final_val_loss'] is None, float('inf') if r['final_val_loss'] is None else r['final_val_loss'], r['optimizer'])):",
-        "    val = '-' if row['final_val_loss'] is None else f\"{row['final_val_loss']:.4f}\"",
+        "for row in sorted(summary_rows, key=loss_sort_key):",
+        "    val = loss_text(row['final_val_loss'])",
         "    step = '-' if row['final_step'] is None else f\"{row['final_step']}/{row['total_steps']}\"",
         "    train_time = '-' if row['train_time_ms'] is None else str(row['train_time_ms'])",
         "    step_avg = '-' if row['step_avg_ms'] is None else f\"{row['step_avg_ms']:.2f}\"",
@@ -505,7 +577,9 @@ def build_sweep_postprocess_shell_lines() -> list[str]:
         "    import matplotlib.pyplot as plt",
         "    fig, ax = plt.subplots(figsize=(10, 6))",
         "    for optimizer, points in sorted(points_by_optimizer.items()):",
-        "        ax.plot([p['step'] for p in points], [p['val_loss'] for p in points], marker='o', linewidth=1.6, label=optimizer)",
+        "        finite_points = [p for p in points if math.isfinite(p['val_loss'])]",
+        "        if finite_points:",
+        "            ax.plot([p['step'] for p in finite_points], [p['val_loss'] for p in finite_points], marker='o', linewidth=1.6, label=optimizer)",
         "    ax.axhline(3.28, color='tab:red', linestyle='--', linewidth=1, label='3.28 target')",
         "    ax.set_title('Real Keller optimizer sweep validation loss')",
         "    ax.set_xlabel('step')",
