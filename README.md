@@ -78,6 +78,76 @@ Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
 
 Official records are timed on 8 NVIDIA H100 GPUs from https://app.primeintellect.ai/. PrimeIntellect has generously sponsored recent validation runs.
 
+## Optimizer family toy lab
+
+This fork also includes a small optimizer comparison harness for quick experiments before changing the speedrun trainer. It does not download FineWeb or touch `train_gpt.py`; it trains a tiny GPT on a fixed toy character corpus and restarts each optimizer from the same initialization with the same sampled batches.
+
+Run a short CPU comparison:
+
+```bash
+python optimizer_family_lab.py --optimizers core --steps 30 --device cpu
+```
+
+Run a larger CUDA toy comparison:
+
+```bash
+python optimizer_family_lab.py --optimizers all --steps 100 --device cuda
+```
+
+Metrics are written to `optimizer_family_runs/<timestamp>/metrics.csv`, with a ranked `summary.md` and machine-readable `summary.json` in the same directory.
+The runner also writes top-5 train-loss `loss_curves.svg` and, when Matplotlib is available, `loss_curves.png`; pass `--plot-top-k 0` to plot every optimizer, `--plot-series both` to include validation points, or `--plot-y-max 4` to cap visible spikes without changing `metrics.csv`.
+
+Use PyTorch-native constructor defaults where `torch.optim` has the optimizer:
+
+```bash
+python optimizer_family_lab.py --optimizers all --optimizer-preset pytorch-defaults --grad-clip 0 --device cuda
+```
+
+Use a staged batch-size ramp and controlled L-BFGS closure settings:
+
+```bash
+python optimizer_family_lab.py --optimizers all --optimizer-preset pytorch-defaults --batch-size-ramp 16,32,64 --lbfgs-lr 0.1 --lbfgs-max-iter 1 --lbfgs-history-size 10 --grad-clip 0 --device cuda
+```
+
+By default the lab records post-update train loss. Use `--train-loss-mode pre-update` to recover the older closure-return/pre-update metric.
+
+Optimizer names map to the family-tree categories as follows:
+
+| Family | Optimizers |
+| --- | --- |
+| No extra state | `sgd` |
+| First-moment / velocity | `momentum`, `nesterov` |
+| Diagonal adaptive | `adagrad`, `rmsprop`, `adamw`, `lion` |
+| Factored diagonal adaptive | `adafactor` |
+| Orthogonalized momentum | `muon` |
+| Structured preconditioners | `shampoo`, `kfac`, `psgd` |
+| Secant / quasi-Newton | `bfgs`, `lbfgs` |
+
+The `kfac` and `psgd` implementations are generic parameter-local proxies because real K-FAC and production PSGD need module-level curvature or preconditioner plumbing. `bfgs` stores a dense inverse Hessian and is guarded by `--bfgs-max-params`, so shrink `--n-embd`, `--n-layer`, or use `lbfgs` when trying larger toy models.
+
+For a one-GPU C2 run through CoreAuto's artifact-backed launcher:
+
+```bash
+CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch optimizer_family_c2_launch:OptimizerFamilyLabC2 --job-name optimizer-family-lab --cluster c2 --yes --no-watch
+```
+
+The real Keller speedrun path is separate from the toy optimizer lab. `train_gpt.py` uses the record trainer's integrated `NorMuonAndAdam` optimizer path and a built-in batch-size/max-sequence schedule; the C2 launcher for that path writes `summary.md`, `summary.json`, `training_schedule.json`, and validation-loss plots under `/mnt/c2-datadisk`.
+
+To run a full Keller benchmark optimizer sweep on one 8-GPU C2 job:
+
+```bash
+CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch real_keller_speedrun_c2_launch:RealKellerOptimizerSweepC2 --job-name real-keller-optimizer-sweep --cluster c2 --kueue-queue-name mlq-full-node --yes --no-watch
+```
+
+This sweep keeps the Keller model, FineWeb data, validation loop, and batch-size schedule. For non-Keller optimizers it uses replicated dense gradient all-reduce instead of the record trainer's sharded optimizer path, so the sweep is for optimizer-family comparison rather than speedrun-record timing. Dense BFGS and closure-based L-BFGS are included in the default list so their unsupported status is captured in the sweep summary instead of being silently omitted.
+If an already-finished sweep needs artifacts regenerated, run the postprocess-only launcher against the same output directory:
+
+```bash
+CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch real_keller_speedrun_c2_launch:RealKellerOptimizerSweepPostprocessC2 --job-name real-keller-optimizer-sweep-postprocess --cluster c2 --set output_dir=/mnt/c2-datadisk/joblogs/training/mark/real-keller-optimizer-sweep/<job-name> --yes --no-watch
+```
+
+The sweep summary treats non-finite validation losses such as `nan` or `inf` as diverged runs rather than silently falling back to an earlier finite validation point.
+
 ## Alternative: Running with Docker (recommended for precise timing)
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
@@ -409,4 +479,3 @@ compared to Shampoo.
 ```
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
-

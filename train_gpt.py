@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
+from optimizer_families import build_optimizer, build_pytorch_default_optimizer, optimizer_metadata
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
@@ -1695,27 +1696,43 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 # -----------------------------------------------------------------------------
 # Training Management
 
+def env_int(name: str, default: int) -> int:
+    """Read an integer environment override."""
+    value = os.environ.get(name)
+    return default if value in (None, "") else int(value)
+
+
+def env_float_optional(name: str) -> float | None:
+    """Read an optional floating-point environment override."""
+    value = os.environ.get(name)
+    return None if value in (None, "") else float(value)
+
+
 @dataclass(slots=True)
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
-    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = env_int("NANOGPT_VAL_TOKENS", 10485760) # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1380  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = env_int("NANOGPT_NUM_SCHEDULED_ITERATIONS", 1380)  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = env_int("NANOGPT_NUM_EXTENSION_ITERATIONS", 10)  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
     #   - explicit sparse connectivity refactor (no generic loop)
     #   - (1 + m_r9) * x self-reference fuse on layer 9
     #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = env_int("NANOGPT_VAL_LOSS_EVERY", 250)  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
+    optimizer_family: str = os.environ.get("NANOGPT_OPTIMIZER_FAMILY", "keller")
+    optimizer_preset: str = os.environ.get("NANOGPT_OPTIMIZER_PRESET", "registry")
+    optimizer_lr: float | None = env_float_optional("NANOGPT_OPTIMIZER_LR")
+    optimizer_weight_decay: float | None = env_float_optional("NANOGPT_OPTIMIZER_WEIGHT_DECAY")
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 15
     bigram_dim: int = 192
@@ -2010,7 +2027,149 @@ class TrainingManager():
         self.row_update_mask.fill(0)
 
 
-        
+class ReplicatedOptimizerTrainingManager:
+    """
+    Full-benchmark optimizer-sweep manager using replicated gradients.
+
+    This path keeps the Keller model, data loader, validation, and schedule, but
+    replaces the record trainer's custom sharded NorMuon/Adam optimizer with a
+    regular optimizer family. Every rank all-reduces dense gradients and applies
+    the same parameter update locally.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.block_size = 128
+        self.optimizer_name = args.optimizer_family.lower()
+        metadata = optimizer_metadata(self.optimizer_name)
+        if metadata.closure_required:
+            raise ValueError(f"{self.optimizer_name} requires closures and is unsupported in the full distributed sweep")
+        if args.optimizer_preset == "pytorch-defaults":
+            self.optimizer = build_pytorch_default_optimizer(
+                self.optimizer_name,
+                model.parameters(),
+                lr=args.optimizer_lr,
+                weight_decay=args.optimizer_weight_decay,
+            )
+        elif args.optimizer_preset == "registry":
+            self.optimizer = build_optimizer(
+                self.optimizer_name,
+                model.parameters(),
+                lr=args.optimizer_lr,
+                weight_decay=0.0 if args.optimizer_weight_decay is None else args.optimizer_weight_decay,
+            )
+        else:
+            raise ValueError(f"unknown optimizer preset {args.optimizer_preset!r}")
+        for group in self.optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        self._param_by_label = {
+            getattr(param, "label", name.rsplit(".", 1)[-1]): param
+            for name, param in model.named_parameters()
+        }
+        self.split_step = training_schedule.split_step
+        self.reset()
+
+    def apply_final_ws_ext(self):
+        self.ws_long = training_schedule.ws_post_yarn_ext
+
+    def get_forward_args(self):
+        return ForwardScheduleConfig(
+            mtp_weights = self.mtp_weights,
+            ws_short = self.ws_short * self.block_size,
+            ws_long = self.ws_long * self.block_size,
+            train_max_seq_len = self.train_max_seq_len
+        )
+
+    def get_transition_steps(self):
+        return [start for start, _ in training_schedule.boundaries[1:]]
+
+    def advance_schedule(self, step: int):
+        stage, _ = training_schedule.lookup(step)
+        self.ws_short, new_ws_long = stage.window_sizes
+        if new_ws_long != self.ws_long:
+            self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
+            self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
+
+        new_batch_size = stage.batch_size
+        new_train_max_seq_len = stage.train_max_seq_len
+        if new_batch_size != self.batch_size or new_train_max_seq_len != self.train_max_seq_len:
+            self.train_loader_send_args = (new_batch_size, new_train_max_seq_len, grad_accum_steps)
+            self.batch_size = new_batch_size
+            self.train_max_seq_len = new_train_max_seq_len
+        else:
+            self.train_loader_send_args = None
+
+        self.ws_long = new_ws_long
+        self.mtp_weights = training_schedule.mtp_weights[step]
+
+    def step_optimizers(self, step: int):
+        step_lr = training_schedule.get_lr(step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * step_lr
+        self._prepare_tied_embedding_gradients()
+        self._all_reduce_gradients()
+        self.optimizer.step()
+        self._sync_tied_embedding_after_step()
+        if step == self.split_step:
+            self.split_embed = True
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def reset(self, state=None):
+        if state is not None:
+            self.optimizer.load_state_dict(state)
+        self.optimizer.zero_grad(set_to_none=True)
+        self.split_embed = False
+        stage, _ = training_schedule.lookup(0)
+        self.ws_short, self.ws_long = stage.window_sizes
+        self.batch_size = stage.batch_size
+        self.train_max_seq_len = stage.train_max_seq_len
+        self.model.yarn.reset()
+        self.model.yarn_paired_head.reset()
+        self.train_loader_send_args = None
+
+    def get_state(self):
+        return copy.deepcopy(self.optimizer.state_dict())
+
+    def sparse_index_update(self, step, bigram_indexes):
+        return None
+
+    def sparse_index_share(self, step):
+        return None
+
+    def _prepare_tied_embedding_gradients(self):
+        if self.split_embed:
+            return
+        lm_head = self._param_by_label.get("lm_head")
+        embed = self._param_by_label.get("embed")
+        if lm_head is not None and embed is not None and lm_head.grad is not None and embed.grad is not None:
+            transpose_add(embed.grad, lm_head.grad)
+            embed.grad = None
+
+    def _all_reduce_gradients(self):
+        if world_size == 1:
+            return
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            if param.grad.is_sparse:
+                param.grad = param.grad.coalesce().to_dense()
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
+    def _sync_tied_embedding_after_step(self):
+        if self.split_embed:
+            return
+        lm_head = self._param_by_label.get("lm_head")
+        embed = self._param_by_label.get("embed")
+        if lm_head is not None and embed is not None:
+            transpose_copy(lm_head.data, embed.data)
+
+
+def build_training_manager(model):
+    """Build the requested full-benchmark training manager."""
+    if args.optimizer_family.lower() in ("keller", "normuon_adam", "normuon-and-adam"):
+        return TrainingManager(model)
+    return ReplicatedOptimizerTrainingManager(model)
+
 
 # -----------------------------------------------------------------------------
 # int main
@@ -2036,6 +2195,7 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"Optimizer family: {args.optimizer_family} preset: {args.optimizer_preset}")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -2068,7 +2228,7 @@ dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 model.quantize_mlp_fp8()
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
-training_manager = TrainingManager(model)
+training_manager = build_training_manager(model)
 
 
 ########################################
