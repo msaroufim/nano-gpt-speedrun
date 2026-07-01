@@ -25,11 +25,20 @@ class OptimizerFamilyLabC2:
     eval_interval: int = 10
     eval_batches: int = 8
     batch_size: int = 64
+    batch_size_ramp: str = ""
     seq_len: int = 128
     n_layer: int = 4
     n_head: int = 4
     n_embd: int = 128
     grad_clip: float = 0.0
+    train_loss_mode: str = "post-update"
+    lbfgs_lr: float = 0.1
+    lbfgs_max_iter: int = 1
+    lbfgs_history_size: int = 10
+    lbfgs_line_search_fn: str = "none"
+    plot_top_k: int = 5
+    plot_series: str = "train"
+    plot_y_max: float = 0.0
     seed: int = 1337
 
     def build(self) -> JobBundle:
@@ -83,6 +92,8 @@ class OptimizerFamilyLabC2:
             str(self.eval_batches),
             "--batch-size",
             str(self.batch_size),
+            "--batch-size-ramp",
+            self.batch_size_ramp,
             "--seq-len",
             str(self.seq_len),
             "--n-layer",
@@ -93,6 +104,20 @@ class OptimizerFamilyLabC2:
             str(self.n_embd),
             "--grad-clip",
             str(self.grad_clip),
+            "--train-loss-mode",
+            self.train_loss_mode,
+            "--lbfgs-lr",
+            str(self.lbfgs_lr),
+            "--lbfgs-max-iter",
+            str(self.lbfgs_max_iter),
+            "--lbfgs-history-size",
+            str(self.lbfgs_history_size),
+            "--lbfgs-line-search-fn",
+            self.lbfgs_line_search_fn,
+            "--plot-top-k",
+            str(self.plot_top_k),
+            "--plot-series",
+            self.plot_series,
             "--seed",
             str(self.seed),
             "--device",
@@ -100,6 +125,8 @@ class OptimizerFamilyLabC2:
             "--out-dir",
             run_dir,
         ]
+        if self.plot_y_max > 0:
+            command.extend(["--plot-y-max", str(self.plot_y_max)])
         quoted_output_dir = shlex.quote(output_dir)
         quoted_run_dir = shlex.quote(run_dir)
         quoted_command = shlex.join(command)

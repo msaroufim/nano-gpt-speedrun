@@ -708,6 +708,9 @@ def build_pytorch_default_optimizer(
     lr: float | None = None,
     weight_decay: float | None = None,
     bfgs_max_params: int = 12000,
+    lbfgs_max_iter: int | None = None,
+    lbfgs_history_size: int | None = None,
+    lbfgs_line_search_fn: str | None = None,
 ) -> Optimizer:
     """Build a native PyTorch optimizer with constructor defaults when available.
 
@@ -741,6 +744,12 @@ def build_pytorch_default_optimizer(
         kwargs = {}
         if lr is not None:
             kwargs["lr"] = lr
+        if lbfgs_max_iter is not None:
+            kwargs["max_iter"] = lbfgs_max_iter
+        if lbfgs_history_size is not None:
+            kwargs["history_size"] = lbfgs_history_size
+        if lbfgs_line_search_fn is not None:
+            kwargs["line_search_fn"] = lbfgs_line_search_fn
         return torch.optim.LBFGS(params, **kwargs)
     return build_optimizer(
         name,

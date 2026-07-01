@@ -192,6 +192,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, etc.")
     parser.add_argument("--corpus-repeats", type=int, default=128)
     parser.add_argument("--bfgs-max-params", type=int, default=12000)
+    parser.add_argument("--lbfgs-lr", type=float, default=None, help="LBFGS-only learning-rate override")
+    parser.add_argument("--lbfgs-max-iter", type=int, default=None, help="LBFGS max_iter override")
+    parser.add_argument("--lbfgs-history-size", type=int, default=None, help="LBFGS history_size override")
+    parser.add_argument(
+        "--lbfgs-line-search-fn",
+        choices=("none", "strong_wolfe"),
+        default="none",
+        help="LBFGS line-search override; 'none' preserves the PyTorch default",
+    )
+    parser.add_argument(
+        "--batch-size-ramp",
+        default="",
+        help="comma-separated batch sizes to use over equally sized training stages, e.g. 16,32,64",
+    )
+    parser.add_argument(
+        "--train-loss-mode",
+        choices=("pre-update", "post-update"),
+        default="post-update",
+        help="whether metrics.csv records the batch loss before or after each optimizer update",
+    )
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument(
         "--plot-top-k",
@@ -199,9 +219,48 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="number of best validation-loss optimizers to show in loss plots; 0 shows all",
     )
+    parser.add_argument(
+        "--plot-series",
+        choices=("train", "val", "both"),
+        default="train",
+        help="which loss series to include in generated plots",
+    )
+    parser.add_argument("--plot-y-max", type=float, default=None, help="optional upper y-axis cap for generated plots")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--no-weight-tie", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.batch_size_schedule = parse_batch_size_ramp(args.batch_size_ramp, args.batch_size)
+    if args.plot_y_max is not None and args.plot_y_max <= 0:
+        raise ValueError("--plot-y-max must be positive")
+    return args
+
+
+def parse_batch_size_ramp(value: str, default_batch_size: int) -> list[int]:
+    """Parse a comma-separated batch-size ramp."""
+    if default_batch_size <= 0:
+        raise ValueError("batch size must be positive")
+    if not value.strip():
+        return [default_batch_size]
+    batch_sizes = []
+    for part in value.split(","):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        batch_size = int(stripped)
+        if batch_size <= 0:
+            raise ValueError("batch-size ramp entries must be positive")
+        batch_sizes.append(batch_size)
+    if not batch_sizes:
+        raise ValueError("batch-size ramp did not contain any batch sizes")
+    return batch_sizes
+
+
+def batch_size_for_step(step_index: int, total_steps: int, batch_size_schedule: list[int]) -> int:
+    """Return the batch size for a zero-based training step."""
+    if total_steps <= 0:
+        raise ValueError("steps must be positive")
+    stage_index = min(len(batch_size_schedule) - 1, step_index * len(batch_size_schedule) // total_steps)
+    return batch_size_schedule[stage_index]
 
 
 def select_device(value: str) -> torch.device:
@@ -244,12 +303,30 @@ def make_batch_schedule(
     return torch.randint(0, max_start, (count, batch_size), generator=generator)
 
 
-def get_batch(tokens: Tensor, starts: Tensor, batch_index: int, seq_len: int, device: torch.device) -> tuple[Tensor, Tensor]:
+def get_batch(
+    tokens: Tensor,
+    starts: Tensor,
+    batch_index: int,
+    seq_len: int,
+    device: torch.device,
+    batch_size: int | None = None,
+) -> tuple[Tensor, Tensor]:
     """Build one language-model batch from pre-sampled start offsets."""
     idxs = starts[batch_index]
+    if batch_size is not None:
+        idxs = idxs[:batch_size]
     x = torch.stack([tokens[int(i) : int(i) + seq_len] for i in idxs])
     y = torch.stack([tokens[int(i) + 1 : int(i) + seq_len + 1] for i in idxs])
     return x.to(device), y.to(device)
+
+
+@torch.no_grad()
+def measure_batch_loss(model: TinyGPT, x: Tensor, y: Tensor) -> float:
+    """Measure the current model loss on one already-materialized batch."""
+    _, loss = model(x, y)
+    if loss is None:
+        raise RuntimeError("expected a training loss")
+    return float(loss.detach().cpu())
 
 
 @torch.no_grad()
@@ -295,6 +372,8 @@ def run_one_optimizer(
     final_train_loss = None
     final_val_loss = None
     steps_completed = 0
+    tokens_seen = 0
+    current_batch_size = None
     start_time = time.perf_counter()
     lr = float("nan")
     implementation = ""
@@ -303,7 +382,9 @@ def run_one_optimizer(
         lr = float(optimizer.param_groups[0].get("lr", float("nan")))
         implementation = f"{optimizer.__class__.__module__}.{optimizer.__class__.__name__}"
         for step in range(args.steps):
-            x, y = get_batch(train_tokens, train_starts, step, args.seq_len, device)
+            current_batch_size = batch_size_for_step(step, args.steps, args.batch_size_schedule)
+            x, y = get_batch(train_tokens, train_starts, step, args.seq_len, device, batch_size=current_batch_size)
+            pre_update_loss = None
             if metadata.closure_required:
 
                 def closure() -> Tensor:
@@ -316,23 +397,28 @@ def run_one_optimizer(
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     return loss
 
-                loss = optimizer.step(closure)
+                pre_update_loss = optimizer.step(closure)
                 optimizer.zero_grad(set_to_none=True)
             else:
                 optimizer.zero_grad(set_to_none=True)
-                _, loss = model(x, y)
-                if loss is None:
+                _, pre_update_loss = model(x, y)
+                if pre_update_loss is None:
                     raise RuntimeError("expected a training loss")
-                loss.backward()
+                pre_update_loss.backward()
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
-            if loss is None:
+                optimizer.zero_grad(set_to_none=True)
+            if args.train_loss_mode == "post-update":
+                final_train_loss = measure_batch_loss(model, x, y)
+            elif pre_update_loss is not None:
+                final_train_loss = float(pre_update_loss.detach().cpu())
+            else:
                 raise RuntimeError("optimizer did not return a loss")
-            final_train_loss = float(loss.detach().cpu())
             if not math.isfinite(final_train_loss):
                 raise FloatingPointError(f"{name} produced non-finite train loss {final_train_loss}")
             steps_completed = step + 1
+            tokens_seen += current_batch_size * args.seq_len
             should_eval = steps_completed % args.eval_interval == 0 or steps_completed == args.steps
             if should_eval:
                 final_val_loss = estimate_loss(model, val_tokens, val_starts, args.seq_len, device)
@@ -344,7 +430,8 @@ def run_one_optimizer(
                     "preset": args.optimizer_preset,
                     "status": "ok",
                     "step": steps_completed,
-                    "tokens": steps_completed * args.batch_size * args.seq_len,
+                    "tokens": tokens_seen,
+                    "batch_size": current_batch_size,
                     "lr": lr,
                     "train_loss": final_train_loss,
                     "val_loss": final_val_loss,
@@ -365,7 +452,8 @@ def run_one_optimizer(
                 "preset": args.optimizer_preset,
                 "status": status,
                 "step": steps_completed,
-                "tokens": steps_completed * args.batch_size * args.seq_len,
+                "tokens": tokens_seen,
+                "batch_size": current_batch_size,
                 "lr": lr,
                 "train_loss": final_train_loss,
                 "val_loss": final_val_loss,
@@ -395,18 +483,23 @@ def run_one_optimizer(
 
 def build_experiment_optimizer(name: str, params: Iterable[Tensor], args: argparse.Namespace) -> torch.optim.Optimizer:
     """Build the requested optimizer preset."""
+    selected_lr = args.lbfgs_lr if name == "lbfgs" and args.lbfgs_lr is not None else args.lr
+    lbfgs_line_search_fn = None if args.lbfgs_line_search_fn == "none" else args.lbfgs_line_search_fn
     if args.optimizer_preset == "pytorch-defaults":
         return build_pytorch_default_optimizer(
             name,
             params,
-            lr=args.lr,
+            lr=selected_lr,
             weight_decay=args.weight_decay,
             bfgs_max_params=args.bfgs_max_params,
+            lbfgs_max_iter=args.lbfgs_max_iter,
+            lbfgs_history_size=args.lbfgs_history_size,
+            lbfgs_line_search_fn=lbfgs_line_search_fn,
         )
     return build_optimizer(
         name,
         params,
-        lr=args.lr,
+        lr=selected_lr,
         weight_decay=0.0 if args.weight_decay is None else args.weight_decay,
         bfgs_max_params=args.bfgs_max_params,
     )
@@ -430,6 +523,7 @@ def write_metrics(output_dir: Path, rows: Iterable[dict[str, str | int | float |
         "status",
         "step",
         "tokens",
+        "batch_size",
         "lr",
         "train_loss",
         "val_loss",
@@ -499,10 +593,16 @@ def print_summary(results: list[ExperimentResult], output_dir: Path) -> None:
         )
 
 
-def write_loss_curve_plots(output_dir: Path, rows: list[dict[str, str | int | float | None]], top_k: int) -> list[Path]:
+def write_loss_curve_plots(
+    output_dir: Path,
+    rows: list[dict[str, str | int | float | None]],
+    top_k: int,
+    plot_series: str,
+    y_max: float | None,
+) -> list[Path]:
     """Write loss-curve plot artifacts."""
     svg_path = output_dir / "loss_curves.svg"
-    write_loss_curve_svg(svg_path, rows, top_k=top_k)
+    write_loss_curve_svg(svg_path, rows, top_k=top_k, plot_series=plot_series, y_max=y_max)
     paths = [svg_path]
     try:
         import matplotlib.pyplot as plt
@@ -523,16 +623,25 @@ def write_loss_curve_plots(output_dir: Path, rows: list[dict[str, str | int | fl
             for row in optimizer_rows
             if row.get("val_loss") not in (None, "")
         ]
-        if train_points:
+        if train_points and plot_series in ("train", "both"):
             x, y = zip(*train_points)
-            (line,) = ax.plot(x, y, linewidth=1.8, label=f"{optimizer} train")
-            if val_points:
-                vx, vy = zip(*val_points)
-                ax.plot(vx, vy, linestyle="--", marker="o", markersize=3, linewidth=1.0, color=line.get_color())
+            label = optimizer if plot_series == "train" else f"{optimizer} train"
+            (line,) = ax.plot(x, y, linewidth=1.8, label=label)
+            color = line.get_color()
+        else:
+            color = None
+        if val_points and plot_series in ("val", "both"):
+            vx, vy = zip(*val_points)
+            label = optimizer if plot_series == "val" else f"{optimizer} val"
+            ax.plot(vx, vy, linestyle="--", marker="o", markersize=3, linewidth=1.0, color=color, label=label)
     title_suffix = "" if top_k <= 0 else f" top {len(selected_optimizers)}"
-    ax.set_title(f"Optimizer family toy NanoGPT{title_suffix} loss curves")
+    series_title = {"train": "train", "val": "validation", "both": "train and validation"}[plot_series]
+    cap_suffix = "" if y_max is None else f" capped at {y_max:g}"
+    ax.set_title(f"Optimizer family toy NanoGPT{title_suffix} {series_title} loss curves{cap_suffix}")
     ax.set_xlabel("step")
     ax.set_ylabel("cross-entropy loss")
+    if y_max is not None:
+        ax.set_ylim(top=y_max)
     ax.grid(True, alpha=0.25)
     ax.legend(ncols=2, fontsize=8)
     fig.tight_layout()
@@ -580,7 +689,20 @@ def select_plot_optimizers(
     return selected[:top_k]
 
 
-def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | None]], top_k: int) -> None:
+def clamp_plot_loss(loss: float, y_max: float | None) -> float:
+    """Clamp one plotted loss value to the optional y-axis cap."""
+    if y_max is None:
+        return loss
+    return min(loss, y_max)
+
+
+def write_loss_curve_svg(
+    path: Path,
+    rows: list[dict[str, str | int | float | None]],
+    top_k: int,
+    plot_series: str,
+    y_max: float | None,
+) -> None:
     """Write a dependency-free SVG loss curve fallback."""
     width = 1200
     height = 720
@@ -592,21 +714,31 @@ def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | No
     plot_height = height - pad_top - pad_bottom
     grouped = group_metric_rows(rows)
     selected_optimizers = select_plot_optimizers(grouped, top_k=top_k)
-    points_by_optimizer = {}
+    series_by_label = []
     all_steps = []
     all_losses = []
-    for optimizer in selected_optimizers:
+    for optimizer_index, optimizer in enumerate(selected_optimizers):
         optimizer_rows = grouped[optimizer]
-        points = [
-            (int(row["step"]), float(row["train_loss"]))
+        train_points = [
+            (int(row["step"]), clamp_plot_loss(float(row["train_loss"]), y_max))
             for row in optimizer_rows
             if row.get("train_loss") not in (None, "")
         ]
-        if not points:
-            continue
-        points_by_optimizer[optimizer] = points
-        all_steps.extend(step for step, _ in points)
-        all_losses.extend(loss for _, loss in points)
+        val_points = [
+            (int(row["step"]), clamp_plot_loss(float(row["val_loss"]), y_max))
+            for row in optimizer_rows
+            if row.get("val_loss") not in (None, "")
+        ]
+        if train_points and plot_series in ("train", "both"):
+            label = optimizer if plot_series == "train" else f"{optimizer} train"
+            series_by_label.append((label, optimizer_index, False, train_points))
+            all_steps.extend(step for step, _ in train_points)
+            all_losses.extend(loss for _, loss in train_points)
+        if val_points and plot_series in ("val", "both"):
+            label = optimizer if plot_series == "val" else f"{optimizer} val"
+            series_by_label.append((label, optimizer_index, True, val_points))
+            all_steps.extend(step for step, _ in val_points)
+            all_losses.extend(loss for _, loss in val_points)
     if not all_steps or not all_losses:
         path.write_text("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>\n")
         return
@@ -643,10 +775,12 @@ def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | No
         return pad_top + (max_loss - loss) * plot_height / (max_loss - min_loss)
 
     title_suffix = "" if top_k <= 0 else f" top {len(selected_optimizers)}"
+    series_title = {"train": "train", "val": "validation", "both": "train and validation"}[plot_series]
+    cap_suffix = "" if y_max is None else f" capped at {y_max:g}"
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<text x="{pad_left}" y="26" font-family="Arial" font-size="20" font-weight="700">Optimizer family toy NanoGPT{title_suffix} loss curves</text>',
+        f'<text x="{pad_left}" y="26" font-family="Arial" font-size="20" font-weight="700">Optimizer family toy NanoGPT{title_suffix} {series_title} loss curves{cap_suffix}</text>',
         f'<line x1="{pad_left}" y1="{pad_top + plot_height}" x2="{pad_left + plot_width}" y2="{pad_top + plot_height}" stroke="#333"/>',
         f'<line x1="{pad_left}" y1="{pad_top}" x2="{pad_left}" y2="{pad_top + plot_height}" stroke="#333"/>',
         f'<text x="{pad_left + plot_width / 2}" y="{height - 18}" font-family="Arial" font-size="14" text-anchor="middle">step</text>',
@@ -659,14 +793,17 @@ def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | No
         parts.append(
             f'<text x="{pad_left - 10}" y="{y + 4:.2f}" font-family="Arial" font-size="12" text-anchor="end">{loss:.2f}</text>'
         )
-    for index, (optimizer, points) in enumerate(points_by_optimizer.items()):
-        color = colors[index % len(colors)]
+    for index, (label, optimizer_index, dashed, points) in enumerate(series_by_label):
+        color = colors[optimizer_index % len(colors)]
         polyline = " ".join(f"{x_scale(step):.2f},{y_scale(loss):.2f}" for step, loss in points)
-        parts.append(f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2"/>')
+        dash_attr = ' stroke-dasharray="6 4"' if dashed else ""
+        parts.append(f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2"{dash_attr}/>')
         legend_y = pad_top + 24 + index * 22
-        parts.append(f'<line x1="{pad_left + plot_width + 28}" y1="{legend_y}" x2="{pad_left + plot_width + 56}" y2="{legend_y}" stroke="{color}" stroke-width="3"/>')
         parts.append(
-            f'<text x="{pad_left + plot_width + 64}" y="{legend_y + 4}" font-family="Arial" font-size="13">{html.escape(optimizer)}</text>'
+            f'<line x1="{pad_left + plot_width + 28}" y1="{legend_y}" x2="{pad_left + plot_width + 56}" y2="{legend_y}" stroke="{color}" stroke-width="3"{dash_attr}/>'
+        )
+        parts.append(
+            f'<text x="{pad_left + plot_width + 64}" y="{legend_y + 4}" font-family="Arial" font-size="13">{html.escape(label)}</text>'
         )
     parts.append("</svg>")
     path.write_text("\n".join(parts) + "\n")
@@ -680,10 +817,11 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
-    min_length = max(4096, (args.seq_len + 1) * args.batch_size * (args.steps + args.eval_batches))
+    max_train_batch_size = max(args.batch_size_schedule)
+    min_length = max(4096, (args.seq_len + 1) * max_train_batch_size * (args.steps + args.eval_batches))
     tokens, stoi, _ = build_tokens(args.corpus_repeats, min_length)
     train_tokens, val_tokens = split_tokens(tokens)
-    train_starts = make_batch_schedule(train_tokens, args.steps, args.batch_size, args.seq_len, args.seed + 1)
+    train_starts = make_batch_schedule(train_tokens, args.steps, max_train_batch_size, args.seq_len, args.seed + 1)
     val_starts = make_batch_schedule(val_tokens, args.eval_batches, args.batch_size, args.seq_len, args.seed + 2)
     config = TinyGPTConfig(
         vocab_size=len(stoi),
@@ -703,13 +841,21 @@ def main() -> None:
         "seed": args.seed,
         "steps": args.steps,
         "batch_size": args.batch_size,
+        "batch_size_schedule": args.batch_size_schedule,
         "seq_len": args.seq_len,
         "eval_interval": args.eval_interval,
         "eval_batches": args.eval_batches,
         "optimizer_preset": args.optimizer_preset,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
+        "train_loss_mode": args.train_loss_mode,
+        "lbfgs_lr": args.lbfgs_lr,
+        "lbfgs_max_iter": args.lbfgs_max_iter,
+        "lbfgs_history_size": args.lbfgs_history_size,
+        "lbfgs_line_search_fn": args.lbfgs_line_search_fn,
         "plot_top_k": args.plot_top_k,
+        "plot_series": args.plot_series,
+        "plot_y_max": args.plot_y_max,
         "model": asdict(config),
         "parameter_count": param_count,
         "optimizer_names": optimizer_names,
@@ -735,7 +881,13 @@ def main() -> None:
     write_metrics(output_dir, all_metrics)
     write_summary(output_dir, results, run_config)
     if not args.no_plot:
-        plot_paths = write_loss_curve_plots(output_dir, all_metrics, top_k=args.plot_top_k)
+        plot_paths = write_loss_curve_plots(
+            output_dir,
+            all_metrics,
+            top_k=args.plot_top_k,
+            plot_series=args.plot_series,
+            y_max=args.plot_y_max,
+        )
         for plot_path in plot_paths:
             print(f"Wrote {plot_path}")
     print_summary(results, output_dir)

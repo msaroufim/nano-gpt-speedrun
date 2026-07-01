@@ -95,13 +95,21 @@ python optimizer_family_lab.py --optimizers all --steps 100 --device cuda
 ```
 
 Metrics are written to `optimizer_family_runs/<timestamp>/metrics.csv`, with a ranked `summary.md` and machine-readable `summary.json` in the same directory.
-The runner also writes top-5 `loss_curves.svg` and, when Matplotlib is available, `loss_curves.png`; pass `--plot-top-k 0` to plot every optimizer.
+The runner also writes top-5 train-loss `loss_curves.svg` and, when Matplotlib is available, `loss_curves.png`; pass `--plot-top-k 0` to plot every optimizer, `--plot-series both` to include validation points, or `--plot-y-max 4` to cap visible spikes without changing `metrics.csv`.
 
 Use PyTorch-native constructor defaults where `torch.optim` has the optimizer:
 
 ```bash
 python optimizer_family_lab.py --optimizers all --optimizer-preset pytorch-defaults --grad-clip 0 --device cuda
 ```
+
+Use a staged batch-size ramp and controlled L-BFGS closure settings:
+
+```bash
+python optimizer_family_lab.py --optimizers all --optimizer-preset pytorch-defaults --batch-size-ramp 16,32,64 --lbfgs-lr 0.1 --lbfgs-max-iter 1 --lbfgs-history-size 10 --grad-clip 0 --device cuda
+```
+
+By default the lab records post-update train loss. Use `--train-loss-mode pre-update` to recover the older closure-return/pre-update metric.
 
 Optimizer names map to the family-tree categories as follows:
 
@@ -122,6 +130,8 @@ For a one-GPU C2 run through CoreAuto's artifact-backed launcher:
 ```bash
 CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch optimizer_family_c2_launch:OptimizerFamilyLabC2 --job-name optimizer-family-lab --cluster c2 --yes --no-watch
 ```
+
+The real Keller speedrun path is separate from the toy optimizer lab. `train_gpt.py` uses the record trainer's integrated `NorMuonAndAdam` optimizer path and a built-in batch-size/max-sequence schedule; the C2 launcher for that path writes `summary.md`, `summary.json`, `training_schedule.json`, and validation-loss plots under `/mnt/c2-datadisk`.
 
 ## Alternative: Running with Docker (recommended for precise timing)
 
