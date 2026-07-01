@@ -110,7 +110,7 @@ class RealKellerSpeedrunC2:
                 f'"$VENV_DIR/bin/python" data/cached_fineweb10B.py {fineweb_chunks}',
                 "chmod +x run.sh",
                 "export START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-                './run.sh 2>&1 | tee "$OUTPUT_DIR/torchrun.stdout.log"',
+                '"$VENV_DIR/bin/python" -m torch.distributed.run --standalone --nproc_per_node=8 train_gpt.py 2>&1 | tee "$OUTPUT_DIR/torchrun.stdout.log"',
                 "export END_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
                 'rm -rf "$OUTPUT_DIR/logs"',
                 'cp -R logs "$OUTPUT_DIR/logs"',
