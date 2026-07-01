@@ -133,6 +133,14 @@ CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch optimizer_family_
 
 The real Keller speedrun path is separate from the toy optimizer lab. `train_gpt.py` uses the record trainer's integrated `NorMuonAndAdam` optimizer path and a built-in batch-size/max-sequence schedule; the C2 launcher for that path writes `summary.md`, `summary.json`, `training_schedule.json`, and validation-loss plots under `/mnt/c2-datadisk`.
 
+To run a full Keller benchmark optimizer sweep on one 8-GPU C2 job:
+
+```bash
+CORE_CLUSTERS_FILE=/path/to/coreauto/clusters.yaml core launch real_keller_speedrun_c2_launch:RealKellerOptimizerSweepC2 --job-name real-keller-optimizer-sweep --cluster c2 --kueue-queue-name mlq-full-node --yes --no-watch
+```
+
+This sweep keeps the Keller model, FineWeb data, validation loop, and batch-size schedule. For non-Keller optimizers it uses replicated dense gradient all-reduce instead of the record trainer's sharded optimizer path, so the sweep is for optimizer-family comparison rather than speedrun-record timing. Dense BFGS and closure-based L-BFGS are included in the default list so their unsupported status is captured in the sweep summary instead of being silently omitted.
+
 ## Alternative: Running with Docker (recommended for precise timing)
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.

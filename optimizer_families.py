@@ -409,9 +409,16 @@ class KFACFamily(Optimizer):
         lr: float = 0.02,
         beta: float = 0.9,
         damping: float = 1e-3,
+        max_preconditioner_dim: int = 512,
         weight_decay: float = 0.0,
     ):
-        defaults = dict(lr=lr, beta=beta, damping=damping, weight_decay=weight_decay)
+        defaults = dict(
+            lr=lr,
+            beta=beta,
+            damping=damping,
+            max_preconditioner_dim=max_preconditioner_dim,
+            weight_decay=weight_decay,
+        )
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -422,6 +429,7 @@ class KFACFamily(Optimizer):
             lr = group["lr"]
             beta = group["beta"]
             damping = group["damping"]
+            max_preconditioner_dim = group["max_preconditioner_dim"]
             weight_decay = group["weight_decay"]
             for p in group["params"]:
                 if p.grad is None:
@@ -430,7 +438,7 @@ class KFACFamily(Optimizer):
                     p.mul_(1 - lr * weight_decay)
                 grad = p.grad
                 state = self.state[p]
-                if grad.ndim == 2:
+                if grad.ndim == 2 and max(grad.shape) <= max_preconditioner_dim:
                     rows, cols = grad.shape
                     left_cov = state.get("left_cov")
                     right_cov = state.get("right_cov")
@@ -470,12 +478,14 @@ class PSGDFamily(Optimizer):
         lr: float = 0.02,
         preconditioner_lr: float = 0.05,
         damping: float = 1e-3,
+        max_preconditioner_dim: int = 512,
         weight_decay: float = 0.0,
     ):
         defaults = dict(
             lr=lr,
             preconditioner_lr=preconditioner_lr,
             damping=damping,
+            max_preconditioner_dim=max_preconditioner_dim,
             weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
@@ -488,6 +498,7 @@ class PSGDFamily(Optimizer):
             lr = group["lr"]
             preconditioner_lr = group["preconditioner_lr"]
             damping = group["damping"]
+            max_preconditioner_dim = group["max_preconditioner_dim"]
             weight_decay = group["weight_decay"]
             for p in group["params"]:
                 if p.grad is None:
@@ -496,7 +507,7 @@ class PSGDFamily(Optimizer):
                     p.mul_(1 - lr * weight_decay)
                 grad = p.grad
                 state = self.state[p]
-                if grad.ndim == 2:
+                if grad.ndim == 2 and max(grad.shape) <= max_preconditioner_dim:
                     rows, cols = grad.shape
                     left_precond = state.get("left_precond")
                     right_precond = state.get("right_precond")
