@@ -95,7 +95,7 @@ python optimizer_family_lab.py --optimizers all --steps 100 --device cuda
 ```
 
 Metrics are written to `optimizer_family_runs/<timestamp>/metrics.csv`, with a ranked `summary.md` and machine-readable `summary.json` in the same directory.
-The runner also writes `loss_curves.svg` and, when Matplotlib is available, `loss_curves.png`.
+The runner also writes top-5 `loss_curves.svg` and, when Matplotlib is available, `loss_curves.png`; pass `--plot-top-k 0` to plot every optimizer.
 
 Use PyTorch-native constructor defaults where `torch.optim` has the optimizer:
 

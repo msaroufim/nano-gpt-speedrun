@@ -193,6 +193,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--corpus-repeats", type=int, default=128)
     parser.add_argument("--bfgs-max-params", type=int, default=12000)
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument(
+        "--plot-top-k",
+        type=int,
+        default=5,
+        help="number of best validation-loss optimizers to show in loss plots; 0 shows all",
+    )
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--no-weight-tie", action="store_true")
     return parser.parse_args()
@@ -493,18 +499,20 @@ def print_summary(results: list[ExperimentResult], output_dir: Path) -> None:
         )
 
 
-def write_loss_curve_plots(output_dir: Path, rows: list[dict[str, str | int | float | None]]) -> list[Path]:
+def write_loss_curve_plots(output_dir: Path, rows: list[dict[str, str | int | float | None]], top_k: int) -> list[Path]:
     """Write loss-curve plot artifacts."""
     svg_path = output_dir / "loss_curves.svg"
-    write_loss_curve_svg(svg_path, rows)
+    write_loss_curve_svg(svg_path, rows, top_k=top_k)
     paths = [svg_path]
     try:
         import matplotlib.pyplot as plt
     except Exception:
         return paths
     by_optimizer = group_metric_rows(rows)
+    selected_optimizers = select_plot_optimizers(by_optimizer, top_k=top_k)
     fig, ax = plt.subplots(figsize=(12, 7))
-    for optimizer, optimizer_rows in by_optimizer.items():
+    for optimizer in selected_optimizers:
+        optimizer_rows = by_optimizer[optimizer]
         train_points = [
             (int(row["step"]), float(row["train_loss"]))
             for row in optimizer_rows
@@ -521,7 +529,8 @@ def write_loss_curve_plots(output_dir: Path, rows: list[dict[str, str | int | fl
             if val_points:
                 vx, vy = zip(*val_points)
                 ax.plot(vx, vy, linestyle="--", marker="o", markersize=3, linewidth=1.0, color=line.get_color())
-    ax.set_title("Optimizer family toy NanoGPT loss curves")
+    title_suffix = "" if top_k <= 0 else f" top {len(selected_optimizers)}"
+    ax.set_title(f"Optimizer family toy NanoGPT{title_suffix} loss curves")
     ax.set_xlabel("step")
     ax.set_ylabel("cross-entropy loss")
     ax.grid(True, alpha=0.25)
@@ -546,7 +555,32 @@ def group_metric_rows(rows: list[dict[str, str | int | float | None]]) -> dict[s
     return grouped
 
 
-def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | None]]) -> None:
+def select_plot_optimizers(
+    grouped: dict[str, list[dict[str, str | int | float | None]]],
+    top_k: int,
+) -> list[str]:
+    """Select optimizer names to include in loss plots."""
+    ranked = []
+    fallback = []
+    for optimizer, optimizer_rows in grouped.items():
+        train_rows = [row for row in optimizer_rows if row.get("train_loss") not in (None, "")]
+        val_rows = [row for row in optimizer_rows if row.get("val_loss") not in (None, "")]
+        if not train_rows:
+            continue
+        fallback.append(optimizer)
+        if val_rows:
+            final_val_row = max(val_rows, key=lambda row: int(row["step"]))
+            ranked.append((float(final_val_row["val_loss"]), optimizer))
+    if top_k <= 0:
+        return fallback
+    selected = [optimizer for _, optimizer in sorted(ranked)[:top_k]]
+    if len(selected) < top_k:
+        selected_set = set(selected)
+        selected.extend(optimizer for optimizer in fallback if optimizer not in selected_set)
+    return selected[:top_k]
+
+
+def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | None]], top_k: int) -> None:
     """Write a dependency-free SVG loss curve fallback."""
     width = 1200
     height = 720
@@ -557,10 +591,12 @@ def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | No
     plot_width = width - pad_left - pad_right
     plot_height = height - pad_top - pad_bottom
     grouped = group_metric_rows(rows)
+    selected_optimizers = select_plot_optimizers(grouped, top_k=top_k)
     points_by_optimizer = {}
     all_steps = []
     all_losses = []
-    for optimizer, optimizer_rows in grouped.items():
+    for optimizer in selected_optimizers:
+        optimizer_rows = grouped[optimizer]
         points = [
             (int(row["step"]), float(row["train_loss"]))
             for row in optimizer_rows
@@ -606,10 +642,11 @@ def write_loss_curve_svg(path: Path, rows: list[dict[str, str | int | float | No
     def y_scale(loss: float) -> float:
         return pad_top + (max_loss - loss) * plot_height / (max_loss - min_loss)
 
+    title_suffix = "" if top_k <= 0 else f" top {len(selected_optimizers)}"
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<text x="{pad_left}" y="26" font-family="Arial" font-size="20" font-weight="700">Optimizer family toy NanoGPT loss curves</text>',
+        f'<text x="{pad_left}" y="26" font-family="Arial" font-size="20" font-weight="700">Optimizer family toy NanoGPT{title_suffix} loss curves</text>',
         f'<line x1="{pad_left}" y1="{pad_top + plot_height}" x2="{pad_left + plot_width}" y2="{pad_top + plot_height}" stroke="#333"/>',
         f'<line x1="{pad_left}" y1="{pad_top}" x2="{pad_left}" y2="{pad_top + plot_height}" stroke="#333"/>',
         f'<text x="{pad_left + plot_width / 2}" y="{height - 18}" font-family="Arial" font-size="14" text-anchor="middle">step</text>',
@@ -672,6 +709,7 @@ def main() -> None:
         "optimizer_preset": args.optimizer_preset,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
+        "plot_top_k": args.plot_top_k,
         "model": asdict(config),
         "parameter_count": param_count,
         "optimizer_names": optimizer_names,
@@ -697,7 +735,7 @@ def main() -> None:
     write_metrics(output_dir, all_metrics)
     write_summary(output_dir, results, run_config)
     if not args.no_plot:
-        plot_paths = write_loss_curve_plots(output_dir, all_metrics)
+        plot_paths = write_loss_curve_plots(output_dir, all_metrics, top_k=args.plot_top_k)
         for plot_path in plot_paths:
             print(f"Wrote {plot_path}")
     print_summary(results, output_dir)
