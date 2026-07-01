@@ -78,6 +78,38 @@ Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
 
 Official records are timed on 8 NVIDIA H100 GPUs from https://app.primeintellect.ai/. PrimeIntellect has generously sponsored recent validation runs.
 
+## Optimizer family toy lab
+
+This fork also includes a small optimizer comparison harness for quick experiments before changing the speedrun trainer. It does not download FineWeb or touch `train_gpt.py`; it trains a tiny GPT on a fixed toy character corpus and restarts each optimizer from the same initialization with the same sampled batches.
+
+Run a short CPU comparison:
+
+```bash
+python optimizer_family_lab.py --optimizers core --steps 30 --device cpu
+```
+
+Run a larger CUDA toy comparison:
+
+```bash
+python optimizer_family_lab.py --optimizers all --steps 100 --device cuda
+```
+
+Metrics are written to `optimizer_family_runs/<timestamp>/metrics.csv`, with a ranked `summary.md` and machine-readable `summary.json` in the same directory.
+
+Optimizer names map to the family-tree categories as follows:
+
+| Family | Optimizers |
+| --- | --- |
+| No extra state | `sgd` |
+| First-moment / velocity | `momentum`, `nesterov` |
+| Diagonal adaptive | `adagrad`, `rmsprop`, `adamw`, `lion` |
+| Factored diagonal adaptive | `adafactor` |
+| Orthogonalized momentum | `muon` |
+| Structured preconditioners | `shampoo`, `kfac`, `psgd` |
+| Secant / quasi-Newton | `bfgs`, `lbfgs` |
+
+The `kfac` and `psgd` implementations are generic parameter-local proxies because real K-FAC and production PSGD need module-level curvature or preconditioner plumbing. `bfgs` stores a dense inverse Hessian and is guarded by `--bfgs-max-params`, so shrink `--n-embd`, `--n-layer`, or use `lbfgs` when trying larger toy models.
+
 ## Alternative: Running with Docker (recommended for precise timing)
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
@@ -409,4 +441,3 @@ compared to Shampoo.
 ```
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
-
